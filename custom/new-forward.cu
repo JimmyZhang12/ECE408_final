@@ -1,11 +1,16 @@
 #include <cmath>
 #include <iostream>
 #include "gpu-new-forward.h"
-#define TILE_WIDTH 4
+#define TILE_WIDTH 16
 #define KERNEL_SIZE 7
+#define RADIUS 3
+#define O_TILE_WIDTH TILE_WIDTH-6
 
 __constant__ float K_ONE[4*KERNEL_SIZE*KERNEL_SIZE];
 __constant__ float K_TWO[16*4*KERNEL_SIZE*KERNEL_SIZE];
+
+// TODO: Initialize y to zero (will be made redundant after input channel tree reduction)
+// Investigate coallescing in shared memory?
 
 __global__ void conv_forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
@@ -29,55 +34,86 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
     const int H_out= H - K + 1;
     const int W_out = W - K + 1;
     const int W_grid = ceil(W_out/(1.0 * TILE_WIDTH)); // number of horizontal tiles per output map
-    //const int H_grid = ceil(H_out/(1.0 * TILE_WIDTH)); // number of vertical tiles per output ma
+#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
+#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
+#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+#define k1_4d(i3, i2, i1, i0) K_ONE[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+#define k2_4d(i3, i2, i1, i0) K_TWO[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
-    // We have some nice #defs for you below to simplify indexing. Feel free to use them, or create your own.
-    // An example use of these macros:
-    // float a = y4d(0,0,0,0)
-    // y4d(0,0,0,0) = a
-
-    #define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
-    #define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-    #define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
-	#define k1_4d(i3, i2, i1, i0) K_ONE[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
-	#define k2_4d(i3, i2, i1, i0) K_TWO[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
     // Insert your GPU convolution kernel code here
-    // int h = blockIdx.y / W_grid + threadIdx.y;
-    // int w = blockIdx.y % W_grid + threadIdx.x;
-    // float acc = 0.;
-    // for (int c = 0; c < C; c++) { // sum over all input channels
-    //     for (int p = 0; p < K; p++) // loop over KxK filter
-    //     for (int q = 0; q < K; q++)
-    //     acc += X[c, h + p, w + q] * W[m, c, p, q];
-    // }
-    int m = blockIdx.x;
-    int h = (blockIdx.y / W_grid) * TILE_WIDTH + threadIdx.y;
-    int w = (blockIdx.y % W_grid) * TILE_WIDTH + threadIdx.x;
-    if(h<H_out && w<W_out){
-        for(int b=0; b < B; b++) {
-            y4d(b, m, h, w) = 0.0;
-            float acc = 0.;
-            for (int c = 0; c < C; c++){ // sum over all input channels
-                for (int p = 0; p < K; p++) // loop over KxK filter
-                    for (int q = 0; q < K; q++){
-						if (M == 4)
-                            acc += x4d(b,c, h + p, w + q) * k1_4d(m, c, p, q);
-						else
-                            acc += x4d(b,c, h + p, w + q) * k2_4d(m, c, p, q);
-                    }
+    __shared__ float D[TILE_WIDTH][TILE_WIDTH];
+    int x_idx = blockIdx.x * O_TILE_WIDTH + threadIdx.x;
+    int y_idx = blockIdx.y * O_TILE_WIDTH + threadIdx.y;
+    int c = blockIdx.z % C;
+    int b = blockIdx.z / C;
+    
+    // Load into shared memory
+    D[threadIdx.y][threadIdx.x] = (x_idx<0||y_idx<0||x_idx>=W||y_idx>=H) ? 0 : x4d(b,c,y_idx,x_idx);
+    __syncthreads();
+    // compute for each kernel
+    if (threadIdx.x >= RADIUS && threadIdx.y >= RADIUS && threadIdx.x < TILE_WIDTH-RADIUS && threadIdx.y < TILE_WIDTH-RADIUS)
+    for (int m = 0; m < M; m++) {
+        float acc = 0;
+        // iterate over y
+        for (int p = -RADIUS; p < RADIUS+1; p++) {
+            // iterate over x
+            for (int q = -RADIUS; q < RADIUS+1; q++) {
+                if (M == 4)
+                    acc += D[threadIdx.y+p][threadIdx.x+q] * k1_4d(m,c,p+RADIUS,q+RADIUS);
+                else 
+                    acc += D[threadIdx.y+p][threadIdx.x+q] * k2_4d(m,c,p+RADIUS,q+RADIUS);
             }
-                    
-        y4d(b, m, h, w) = acc;
-        }   
-    }
- 
+        }
+        if (x_idx>=RADIUS&&y_idx>=RADIUS&&x_idx<W_out+RADIUS&&y_idx<H_out+RADIUS)
+            atomicAdd(&y4d(b, m, y_idx-RADIUS, x_idx-RADIUS), acc);
 
-    #undef y4d
-    #undef x4d
-    #undef k4d
-	#undef k1_4d
-	#undef k2_4d
+    }
+
+#undef y4d
+#undef x4d
+#undef k4d
+#undef k1_4d
+#undef k2_4d
+
 }
+
+/*__global__ void tree_reduce(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
+{
+
+    const int H_out = H - K + 1;
+    const int W_out = W - K + 1;
+
+#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
+#define y5d(i4, i3, i2, i1, i0) y[(i4) * (B * M * H_out * W_out) + (i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
+#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
+#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+
+    // Insert your GPU convolution kernel code here
+    __shared__ float D[O_TILE_WIDTH][O_TILE_WIDTH][16]; // Change to 6
+    int x_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int y_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int b = blockIdx.z / M;
+    int m = blockIdx.z % M;
+    int c = threadIdx.z;
+    
+    // Load into shared memory
+    D[threadIdx.x][threadIdx.y][threadIdx.z] = (x_idx<0||y_idx<0||x_idx>=W_out||y_idx>=H_out) ? 0 : x4d(c);
+    __syncthreads();
+    // compute for each kernel
+    float val = 0;
+    if (c == 0)
+        for (unsigned int c_idx=0; c_idx < C; c_idx++) {
+            val += D[threadIdx.x][threadIdx.y][c_idx];
+        }
+    if (c==0&&x_idx>=0&&y_idx>=0&&x_idx<W_out&&y_idx<H_out)
+        y5d(c, b, m, y_idx, x_idx) = val;
+
+#undef y4d
+#undef y5d
+#undef x4d
+#undef k4d
+}*/
+
 
 __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x, const float *host_k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
@@ -92,7 +128,7 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
 
     cudaMalloc((void **) &device_x, (B*C*H*W) * sizeof(float));
     cudaMalloc((void **) &device_y, (B*M*H_out*W_out) * sizeof(float));
-    cudaMalloc((void **) &device_k, (C*M*K*K) * sizeof(float));
+    //cudaMalloc((void **) &device_k, (C*M*K*K) * sizeof(float));
     bool val;
     val = cudaMemcpy(device_x, host_x, (B*C*H*W) * sizeof(float), cudaMemcpyHostToDevice);
     //std::cout << std::boolalpha << val << '\n';
@@ -100,20 +136,22 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     val = cudaMemcpy(device_y, host_y, (B*M*H_out*W_out) * sizeof(float), cudaMemcpyHostToDevice);
     //std::cout << std::boolalpha << val << '\n';
 
-    val = cudaMemcpy(device_k, host_k, (C*M*K*K) * sizeof(float), cudaMemcpyHostToDevice);
+    //val = cudaMemcpy(device_k, host_k, (C*M*K*K) * sizeof(float), cudaMemcpyHostToDevice);
     //std::cout << std::boolalpha << val << '\n';
 
 	if (M == 4)	cudaMemcpyToSymbol(K_ONE, host_k, M*C*K*K*sizeof(float));
 	if (M == 16) cudaMemcpyToSymbol(K_TWO, host_k, M*C*K*K*sizeof(float));
 
     // Set the kernel dimensions and call the kernel
-    int W_grid = ceil((float)(1.0*W_out)/(1.0 * TILE_WIDTH)); // number of horizontal tiles per output map
-    int H_grid = ceil((float)(1.0*H_out)/(1.0 * TILE_WIDTH)); // number of vertical tiles per output map
-    int Y = H_grid * W_grid;
-    dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
-    dim3 gridDim(M, Y, 1);
+    //int W_grid = ceil((float)(1.0*W_out)/(1.0 * O_TILE_WIDTH)); // number of horizontal tiles per output map
+    //int H_grid = ceil((float)(1.0*H_out)/(1.0 * O_TILE_WIDTH)); // number of vertical tiles per output map
+    //int Y = H_grid * W_grid;
+    //dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
+    //dim3 gridDim(M, Y, C*B);
+    dim3 dimGrid(ceil(1.0*W_out/(O_TILE_WIDTH)), ceil(1.0*H_out/(O_TILE_WIDTH)), C*B);
+    dim3 dimBlock(TILE_WIDTH, TILE_WIDTH, 1);
 
-    conv_forward_kernel<<< gridDim, blockDim>>>(
+    conv_forward_kernel<<< dimGrid, dimBlock>>>(
         device_y, device_x, device_k, 
         B,M, C, H, W, K
     );
@@ -123,7 +161,7 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     // Free device memory
     cudaFree(device_y);
     cudaFree(device_x);
-    cudaFree(device_k);
+    //cudaFree(device_k);
 
 
     //Useful snippet for error checking
