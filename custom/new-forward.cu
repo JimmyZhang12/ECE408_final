@@ -3,6 +3,9 @@
 #include <iostream>
 #include "gpu-new-forward.h"
 #define TILE_WIDTH 32
+#define KERNEL_SIZE 7
+__constant__ float K_ONE[4*KERNEL_SIZE*KERNEL_SIZE];
+__constant__ float K_TWO[16*4*KERNEL_SIZE*KERNEL_SIZE];
 
 __global__ void x_unroll(float *x, float *x_unroll, const int B, const int M, const int C, const int H, const int W, const int K){
     const int H_out = H - K + 1;
@@ -33,14 +36,24 @@ __global__ void k_unroll(float *k, float *k_unroll, const int B, const int M, co
 
     //M X C X K X K
     #define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+	#define k1_4d(i3, i2, i1, i0) K_ONE[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+	#define k2_4d(i3, i2, i1, i0) K_TWO[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
     //K^2 * C X M
     #define k_unroll_4d(i1, i0) k_unroll[(i1) * (C*K*K) + i0]
 
 
     int h = tx / K; 
     int w = tx % K; 
+
+    if (M == 4)
+        k_unroll_4d(m, c*K*K + tx) = k1_4d(m, c, h, w);
+	else
+        k_unroll_4d(m, c*K*K + tx) = k2_4d(m, c, h, w);
     
-    k_unroll_4d(m, c*K*K + tx) = k4d(m, c, h, w);
+    //k_unroll_4d(m, c*K*K + tx) = k4d(m, c, h, w);
+
+	#undef k1_4d
+	#undef k2_4d
 }
 
 //C = A*B
@@ -57,6 +70,9 @@ __global__ void matrixMultiplyShared(float *x_unroll, float *k_unroll, float *y,
     #define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
     #define k_unroll_4d(i1, i0) k_unroll[(i1) * (C*K*K) + i0]
     #define x_unroll_4d(i2, i1, i0) x_unroll[(i2) * (C*K*K*H_out*W_out) + (i1) * (H_out*W_out) + i0]
+  	#define k1_4d(i3, i2) K_ONE[(i3) * (C * K * K) + (i2)]
+	#define k2_4d(i3, i2) K_TWO[(i3) * (C * K * K) + (i2)]
+
 
     int row = blockIdx.y * TILE_WIDTH + threadIdx.y; 
     int col = blockIdx.x * TILE_WIDTH + threadIdx.x;
@@ -70,7 +86,12 @@ __global__ void matrixMultiplyShared(float *x_unroll, float *k_unroll, float *y,
 
         for(int p=0; p<ceil(k_cols / (float)TILE_WIDTH); ++p){
             if (row < k_rows && (threadIdx.x + p*TILE_WIDTH) < k_cols) 
-                rowTile[threadIdx.y][threadIdx.x] = k_unroll_4d(row, threadIdx.x + (p*TILE_WIDTH) );
+                //rowTile[threadIdx.y][threadIdx.x] = k_unroll_4d(row, threadIdx.x + (p*TILE_WIDTH) );
+			    if (M == 4)
+			        rowTile[threadIdx.y][threadIdx.x] = k1_4d(row, threadIdx.x + (p*TILE_WIDTH) );
+				else
+			        rowTile[threadIdx.y][threadIdx.x] = k2_4d(row, threadIdx.x + (p*TILE_WIDTH) );
+
             else
                 rowTile[threadIdx.y][threadIdx.x] = 0.0;
             
@@ -119,6 +140,9 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     cudaMalloc((void **) &device_x_unroll, B * (C*K*K) * (H_out*W_out) * sizeof(float));
     cudaMalloc((void **) &device_k_unroll, K*K * C * M * sizeof(float));
 
+	if (M == 4)	cudaMemcpyToSymbol(K_ONE, host_k, M*C*K*K*sizeof(float));
+	if (M == 16) cudaMemcpyToSymbol(K_TWO, host_k, M*C*K*K*sizeof(float));
+
     bool val;
     val = cudaMemcpy(device_x, host_x, (B*C*H*W) * sizeof(float), cudaMemcpyHostToDevice);
     //std::cout << std::boolalpha << val << '\n';
@@ -136,8 +160,7 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
 
     dim3 gridDim_k(C, M, 1);
     dim3 blockDim_k(K*K, 1, 1);
-    k_unroll<<< gridDim_k, blockDim_k>>>(device_k, device_k_unroll, 
-                B, M, C, H, W, K);
+    //k_unroll<<< gridDim_k, blockDim_k>>>(device_k, device_k_unroll, B, M, C, H, W, K);
 
     // if (W == 86){
     //     host_x_unroll = (float *) malloc(sizeof(float)*B * (C*K*K) * (H_out*W_out));
