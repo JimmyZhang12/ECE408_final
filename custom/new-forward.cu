@@ -2,9 +2,10 @@
 #include <cmath>
 #include <iostream>
 #include "gpu-new-forward.h"
+#include "cuda_fp16.h"
 #define TILE_WIDTH 32
 
-__global__ void x_unroll(float *x, float *x_unroll, const int B, const int M, const int C, const int H, const int W, const int K){
+__global__ void x_unroll(float *x, __half *x_unroll, const int B, const int M, const int C, const int H, const int W, const int K){
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
 
@@ -20,11 +21,11 @@ __global__ void x_unroll(float *x, float *x_unroll, const int B, const int M, co
 
     for(int b=0; b<B; b++){
         int row = tx + by*K*K;
-        x_unroll_4d(b, row, bx) = x4d(b, by, h_x, w_x);
+        x_unroll_4d(b, row, bx) = __float2half(x4d(b, by, h_x, w_x));
     }
 
 }
-__global__ void k_unroll(float *k, float *k_unroll, const int B, const int M, const int C, const int H, const int W, const int K){
+__global__ void k_unroll(float *k, __half *k_unroll, const int B, const int M, const int C, const int H, const int W, const int K){
     //const int H_out = H - K + 1;
     //const int W_out = W - K + 1;
     int tx = threadIdx.x;
@@ -40,11 +41,11 @@ __global__ void k_unroll(float *k, float *k_unroll, const int B, const int M, co
     int h = tx / K; 
     int w = tx % K; 
     
-    k_unroll_4d(m, c*K*K + tx) = k4d(m, c, h, w);
+    k_unroll_4d(m, c*K*K + tx) = __float2half(k4d(m, c, h, w));
 }
 
 //C = A*B
-__global__ void matrixMultiplyShared(float *x_unroll, float *k_unroll, float *y,
+__global__ void matrixMultiplyShared(__half *x_unroll, __half *k_unroll, float *y,
                                      const int B, const int M, const int C, const int H, const int W, const int K) {
 
     const int H_out = H - K + 1;
@@ -61,12 +62,12 @@ __global__ void matrixMultiplyShared(float *x_unroll, float *k_unroll, float *y,
     int row = blockIdx.y * TILE_WIDTH + threadIdx.y; 
     int col = blockIdx.x * TILE_WIDTH + threadIdx.x;
 
-    __shared__ float rowTile[TILE_WIDTH][TILE_WIDTH];
-    __shared__ float colTile[TILE_WIDTH][TILE_WIDTH];
+    __shared__ __half rowTile[TILE_WIDTH][TILE_WIDTH];
+    __shared__ __half colTile[TILE_WIDTH][TILE_WIDTH];
     
 
     for(int b=0; b<B; b++){
-        float accum = 0;
+        __half accum = 0;
 
         for(int p=0; p<ceil(k_cols / (float)TILE_WIDTH); ++p){
             if (row < k_rows && (threadIdx.x + p*TILE_WIDTH) < k_cols) 
@@ -88,7 +89,7 @@ __global__ void matrixMultiplyShared(float *x_unroll, float *k_unroll, float *y,
 
         }
         if (row < M && col < H_out*W_out) 
-            y4d(b, row, col/W_out, col%W_out) = accum;
+            y4d(b, row, col/W_out, col%W_out) = __half2float(accum);
     }
   
 }
@@ -102,10 +103,8 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     float *device_y;
     float *device_x;
     float *device_k;
-    float *device_x_unroll;
-    float *device_k_unroll;
-    float *host_x_unroll;
-    float *host_k_unroll;
+    __half *device_x_unroll;
+    __half *device_k_unroll;
 
     // std::cout << "K: " << K << " M: " << M << " C: " << C << std::endl;
     // std::cout << "B: " << B << " H: " << H << " W: " << W << std::endl;
@@ -116,8 +115,8 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     cudaMalloc((void **) &device_y, (B*M*H_out*W_out) * sizeof(float));
     cudaMalloc((void **) &device_k, (C*M*K*K) * sizeof(float));
     //B X M X C
-    cudaMalloc((void **) &device_x_unroll, B * (C*K*K) * (H_out*W_out) * sizeof(float));
-    cudaMalloc((void **) &device_k_unroll, K*K * C * M * sizeof(float));
+    cudaMalloc((void **) &device_x_unroll, B * (C*K*K) * (H_out*W_out) * sizeof(__half));
+    cudaMalloc((void **) &device_k_unroll, K*K * C * M * sizeof(__half));
 
     bool val;
     val = cudaMemcpy(device_x, host_x, (B*C*H*W) * sizeof(float), cudaMemcpyHostToDevice);
@@ -138,50 +137,6 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     dim3 blockDim_k(K*K, 1, 1);
     k_unroll<<< gridDim_k, blockDim_k>>>(device_k, device_k_unroll, 
                 B, M, C, H, W, K);
-
-    // if (W == 86){
-    //     host_x_unroll = (float *) malloc(sizeof(float)*B * (C*K*K) * (H_out*W_out));
-    //     host_k_unroll = (float *) malloc(sizeof(float)*K*K * C * M);
-    
-    //     val = cudaMemcpy(host_x_unroll, device_x_unroll, B * (C*K*K) * (H_out*W_out) * sizeof(float), cudaMemcpyDeviceToHost);
-    //     #define x4d(i3, i2, i1, i0) host_x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-    //     #define x_unroll_4d(i2, i1, i0) host_x_unroll[(i2) * (C*K*K*H_out*W_out) + (i1) * (H_out*W_out) + i0]
-    //     val = cudaMemcpy(host_k_unroll, device_k_unroll, K*K * C * M * sizeof(float), cudaMemcpyDeviceToHost);
-    //     #define k4d(i3, i2, i1, i0) host_k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
-    //     #define k_unroll_4d(i1, i0) host_k_unroll[(i1) * (C*K*K) + i0]
-    //     for(int i=0; i<H; i++){
-    //         for(int j=0; j<W; j++)
-    //             std::cout << x4d(60,0,i,j) << " ";
-    //         std::cout << std::endl << std::endl;
-    //     }
-
-    //     std::cout  << std::endl << "****x unroll***" << std::endl;
-    //     for(int j=0; j<H_out*W_out; j++){
-    //         for(int i=0; i<K*K; i++)
-    //             std::cout << x_unroll_4d(60,i,j) << " ";
-    //         std::cout << std::endl << std::endl;
-    //     }
-    //     std::cout << std::endl;
-    //     for(int m=0; m<M; m++){
-    //         for(int i=0; i<K; i++){
-    //             for(int j=0; j<K; j++)
-    //                 std::cout << k4d(m,0,i,j) << " ";
-    //             std::cout << std::endl;
-    //         }
-    //         std::cout << std::endl;
-    //         std::cout << std::endl;
-    //         std::cout << std::endl;
-    //     }
-
-    //     std::cout  << std::endl << "****k unroll***" << std::endl;
-    //     for(int j=0; j<M; j++){
-    //         for(int i=0; i<K*K*C; i++)
-    //             std::cout << k_unroll_4d(j,i) << " ";
-    //         std::cout << std::endl << std::endl;
-    //     }
-    //     std::cout << std::endl;
-    // }
-
 
     dim3 gridDim(ceil(H_out*W_out/(1.0 * TILE_WIDTH)), ceil(M/(1.0 * TILE_WIDTH)), 1);
     dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
