@@ -2,6 +2,10 @@
 #include <iostream>
 #include "gpu-new-forward.h"
 #define TILE_WIDTH 4
+#define KERNEL_SIZE 7
+
+__constant__ float K_ONE[4*KERNEL_SIZE*KERNEL_SIZE];
+__constant__ float K_TWO[16*4*KERNEL_SIZE*KERNEL_SIZE];
 
 __global__ void conv_forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
@@ -35,7 +39,8 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
     #define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
     #define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
     #define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
-
+	#define k1_4d(i3, i2, i1, i0) K_ONE[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+	#define k2_4d(i3, i2, i1, i0) K_TWO[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
     // Insert your GPU convolution kernel code here
     // int h = blockIdx.y / W_grid + threadIdx.y;
     // int w = blockIdx.y % W_grid + threadIdx.x;
@@ -55,7 +60,10 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
             for (int c = 0; c < C; c++){ // sum over all input channels
                 for (int p = 0; p < K; p++) // loop over KxK filter
                     for (int q = 0; q < K; q++){
-                            acc += x4d(b,c, h + p, w + q) * k4d(m, c, p, q);
+						if (M == 4)
+                            acc += x4d(b,c, h + p, w + q) * k1_4d(m, c, p, q);
+						else
+                            acc += x4d(b,c, h + p, w + q) * k2_4d(m, c, p, q);
                     }
             }
                     
@@ -67,6 +75,8 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
     #undef y4d
     #undef x4d
     #undef k4d
+	#undef k1_4d
+	#undef k2_4d
 }
 
 __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x, const float *host_k, const int B, const int M, const int C, const int H, const int W, const int K)
@@ -93,6 +103,8 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     val = cudaMemcpy(device_k, host_k, (C*M*K*K) * sizeof(float), cudaMemcpyHostToDevice);
     //std::cout << std::boolalpha << val << '\n';
 
+	if (M == 4)	cudaMemcpyToSymbol(K_ONE, host_k, M*C*K*K*sizeof(float));
+	if (M == 16) cudaMemcpyToSymbol(K_TWO, host_k, M*C*K*K*sizeof(float));
 
     // Set the kernel dimensions and call the kernel
     int W_grid = ceil((float)(1.0*W_out)/(1.0 * TILE_WIDTH)); // number of horizontal tiles per output map
