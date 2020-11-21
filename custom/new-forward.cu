@@ -4,6 +4,10 @@
 #include "gpu-new-forward.h"
 #include "cuda_fp16.h"
 #define TILE_WIDTH 32
+#define KERNEL_SIZE 7
+
+__constant__ float K_ONE[4*KERNEL_SIZE*KERNEL_SIZE];
+__constant__ float K_TWO[16*4*KERNEL_SIZE*KERNEL_SIZE];
 
 __global__ void x_unroll(float *x, __half *x_unroll, const int B, const int M, const int C, const int H, const int W, const int K){
     const int H_out = H - K + 1;
@@ -57,6 +61,10 @@ __global__ void matrixMultiplyShared(__half *x_unroll, __half *k_unroll, float *
 
     #define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
     #define k_unroll_4d(i1, i0) k_unroll[(i1) * (C*K*K) + i0]
+
+    #define k_unroll_4d1(i1, i0) K_ONE[(i1) * (C*K*K) + i0]
+    #define k_unroll_4d2(i1, i0) K_TWO[(i1) * (C*K*K) + i0]
+
     #define x_unroll_4d(i2, i1, i0) x_unroll[(i2) * (C*K*K*H_out*W_out) + (i1) * (H_out*W_out) + i0]
 
     int row = blockIdx.y * TILE_WIDTH + threadIdx.y; 
@@ -70,10 +78,19 @@ __global__ void matrixMultiplyShared(__half *x_unroll, __half *k_unroll, float *
         __half accum = 0;
 
         for(int p=0; p<ceil(k_cols / (float)TILE_WIDTH); ++p){
-            if (row < k_rows && (threadIdx.x + p*TILE_WIDTH) < k_cols) 
-                rowTile[threadIdx.y][threadIdx.x] = k_unroll_4d(row, threadIdx.x + (p*TILE_WIDTH) );
-            else
-                rowTile[threadIdx.y][threadIdx.x] = 0.0;
+            if(M==4){
+                if (row < k_rows && (threadIdx.x + p*TILE_WIDTH) < k_cols) 
+                    rowTile[threadIdx.y][threadIdx.x] = k_unroll_4d1(row, threadIdx.x + (p*TILE_WIDTH) );
+                else
+                    rowTile[threadIdx.y][threadIdx.x] = 0.0;
+                }
+            else{
+                if (row < k_rows && (threadIdx.x + p*TILE_WIDTH) < k_cols) 
+                    rowTile[threadIdx.y][threadIdx.x] = k_unroll_4d2(row, threadIdx.x + (p*TILE_WIDTH) );
+                else
+                    rowTile[threadIdx.y][threadIdx.x] = 0.0;
+            }
+
             
             if (col < x_cols && (threadIdx.y+TILE_WIDTH*p) < x_rows)
                 colTile[threadIdx.y][threadIdx.x] = x_unroll_4d(b, (threadIdx.y + p*TILE_WIDTH), col);
@@ -96,7 +113,7 @@ __global__ void matrixMultiplyShared(__half *x_unroll, __half *k_unroll, float *
 
 __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x, const float *host_k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
-
+    int B_interval = (B>5000)?2000:B;
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
     // Declare relevant device pointers
@@ -111,52 +128,45 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     // std::cout << "H_out: " << H_out << " W_out: " << W_out << std::endl;
 
     // Allocate memory and copy over the relevant data structures to the GPU
-    cudaMalloc((void **) &device_x, (B*C*H*W) * sizeof(float));
-    cudaMalloc((void **) &device_y, (B*M*H_out*W_out) * sizeof(float));
+    cudaMalloc((void **) &device_x, (B_interval*C*H*W) * sizeof(float));
     cudaMalloc((void **) &device_k, (C*M*K*K) * sizeof(float));
-    //B X M X C
-    cudaMalloc((void **) &device_x_unroll, B * (C*K*K) * (H_out*W_out) * sizeof(__half));
+    cudaMalloc((void **) &device_y, (B*M*H_out*W_out) * sizeof(float));
     cudaMalloc((void **) &device_k_unroll, K*K * C * M * sizeof(__half));
-
+    cudaMalloc((void **) &device_x_unroll, B_interval * (C*K*K) * (H_out*W_out) * sizeof(__half));
     bool val;
-    val = cudaMemcpy(device_x, host_x, (B*C*H*W) * sizeof(float), cudaMemcpyHostToDevice);
-    //std::cout << std::boolalpha << val << '\n';
-
-    val = cudaMemcpy(device_y, host_y, (B*M*H_out*W_out) * sizeof(float), cudaMemcpyHostToDevice);
-    //std::cout << std::boolalpha << val << '\n';
 
     val = cudaMemcpy(device_k, host_k, (C*M*K*K) * sizeof(float), cudaMemcpyHostToDevice);
     //std::cout << std::boolalpha << val << '\n';
-
-    dim3 gridDim_x(H_out*W_out, C, 1);
-    dim3 blockDim_x(K*K, 1, 1);
-    x_unroll<<< gridDim_x, blockDim_x>>>(device_x, device_x_unroll, 
-                B, M, C, H, W, K);
+    val = cudaMemcpy(device_y, host_y, (B*M*H_out*W_out) * sizeof(float), cudaMemcpyHostToDevice);
+    //std::cout << std::boolalpha << val << '\n';
 
     dim3 gridDim_k(C, M, 1);
     dim3 blockDim_k(K*K, 1, 1);
     k_unroll<<< gridDim_k, blockDim_k>>>(device_k, device_k_unroll, 
-                B, M, C, H, W, K);
+                                            B, M, C, H, W, K);
 
-    dim3 gridDim(ceil(H_out*W_out/(1.0 * TILE_WIDTH)), ceil(M/(1.0 * TILE_WIDTH)), 1);
-    dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
-    matrixMultiplyShared<<< gridDim, blockDim>>>(device_x_unroll, device_k_unroll, device_y,
-                B, M, C, H, W, K);
+    if (M == 4)	cudaMemcpyToSymbol(K_ONE, device_k, M*C*K*K*sizeof(float));
+    if (M == 16) cudaMemcpyToSymbol(K_TWO, device_k, M*C*K*K*sizeof(float));
 
-    val = cudaMemcpy(host_y, device_y, (B*M*H_out*W_out) * sizeof(float), cudaMemcpyDeviceToHost);
+                      
+    for (int b = 0; b<B; b+=B_interval){
+        val = cudaMemcpy(device_x, host_x + b*C*H*W, (B_interval*C*H*W) * sizeof(float), cudaMemcpyHostToDevice);
+        //std::cout << std::boolalpha << val << '\n';
 
-    // if (W == 86){
-    //     #define y4d(i3, i2, i1, i0) host_y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
+        dim3 gridDim_x(H_out*W_out, C, 1);
+        dim3 blockDim_x(K*K, 1, 1);
+        x_unroll<<< gridDim_x, blockDim_x>>>(device_x, device_x_unroll, 
+                    B_interval, M, C, H, W, K);
 
-    //     for(int i=0; i<H_out; i++){
-    //         for(int j=0; j<W_out; j++){
-    //             float temp = y4d(0,0,i,j);
-    //             std::cout << temp << " ";
-    //         }
-    //         std::cout << std::endl << std::endl;
-    //     }
 
-    // }
+        dim3 gridDim(ceil(H_out*W_out/(1.0 * TILE_WIDTH)), ceil(M/(1.0 * TILE_WIDTH)), 1);
+        dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
+        matrixMultiplyShared<<< gridDim, blockDim>>>(device_x_unroll, device_k_unroll, device_y,
+                    B_interval, M, C, H, W, K);
+        val = cudaMemcpy(host_y + b*M*H_out*W_out, device_y, (B_interval*M*H_out*W_out) * sizeof(float), cudaMemcpyDeviceToHost);
+
+    }
+
 
     cudaError_t error = cudaGetLastError();
     if(error != cudaSuccess)
