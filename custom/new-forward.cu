@@ -1,16 +1,31 @@
 #include <cmath>
 #include <iostream>
 #include "gpu-new-forward.h"
-#define TILE_WIDTH 16
+#define TILE_WIDTH 32
 #define KERNEL_SIZE 7
 #define RADIUS 3
 #define O_TILE_WIDTH TILE_WIDTH-6
+#define ELEMENTS_PER_THREAD 8
+#define INIT_BLOCK_SIZE 256
 
 __constant__ float K_ONE[4*KERNEL_SIZE*KERNEL_SIZE];
 __constant__ float K_TWO[16*4*KERNEL_SIZE*KERNEL_SIZE];
 
 // TODO: Initialize y to zero (will be made redundant after input channel tree reduction)
 // Investigate coallescing in shared memory?
+
+__global__ void initialize_array(float *y, const int num) {
+    int tx = threadIdx.x;
+    int bx = blockIdx.x;
+    int dx = blockDim.x;
+    int stride = dx;
+    int x = bx * dx * ELEMENTS_PER_THREAD + tx;
+    for (int c = 0; c < ELEMENTS_PER_THREAD; c++) {
+        if (x < num)
+            y[x] = 0;
+        x += stride;
+    }
+}
 
 __global__ void conv_forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
@@ -66,7 +81,6 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
         }
         if (x_idx>=RADIUS&&y_idx>=RADIUS&&x_idx<W_out+RADIUS&&y_idx<H_out+RADIUS)
             atomicAdd(&y4d(b, m, y_idx-RADIUS, x_idx-RADIUS), acc);
-
     }
 
 #undef y4d
@@ -148,6 +162,10 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     //int Y = H_grid * W_grid;
     //dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
     //dim3 gridDim(M, Y, C*B);
+    dim3 dimGridInit(ceil(1.0*B*M*H_out*W_out/(INIT_BLOCK_SIZE*ELEMENTS_PER_THREAD)), 1, 1);
+    dim3 dimBlockInit(INIT_BLOCK_SIZE, 1, 1);
+    //initialize_array<<<dimGridInit, dimBlockInit>>>(device_y, B*M*H_out*W_out);
+
     dim3 dimGrid(ceil(1.0*W_out/(O_TILE_WIDTH)), ceil(1.0*H_out/(O_TILE_WIDTH)), C*B);
     dim3 dimBlock(TILE_WIDTH, TILE_WIDTH, 1);
 
