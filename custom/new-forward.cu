@@ -30,7 +30,7 @@ __global__ void matrixMultiplyShared(float *x, float *k, float *y,
     #define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
     #define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
     #define k4d_1(i3, i2, i1, i0) K_ONE[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
-    #define k4d_2(i3, i2, i1, i0) K_ONE[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+    #define k4d_2(i3, i2, i1, i0) K_TWO[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
     #define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
 
@@ -60,13 +60,13 @@ __global__ void matrixMultiplyShared(float *x, float *k, float *y,
         if(M==4){
 
             if (row < k_rows && (threadIdx.x + p*TILE_WIDTH) < k_cols) 
-                rowTile[threadIdx.y][threadIdx.x] = __float2half(k4d(row, c, k_remain/K, k_remain%K));
+                rowTile[threadIdx.y][threadIdx.x] = __float2half(k4d_1(row, c, k_remain/K, k_remain%K));
             else
                 rowTile[threadIdx.y][threadIdx.x] = 0.0;
             }
         else{
             if (row < k_rows && (threadIdx.x + p*TILE_WIDTH) < k_cols) 
-                rowTile[threadIdx.y][threadIdx.x] = __float2half(k4d(row, c, k_remain/K, k_remain%K));
+                rowTile[threadIdx.y][threadIdx.x] = __float2half(k4d_2(row, c, k_remain/K, k_remain%K));
             else
                 rowTile[threadIdx.y][threadIdx.x] = 0.0;
         }
@@ -92,7 +92,7 @@ __global__ void matrixMultiplyShared(float *x, float *k, float *y,
         // for(int i=0; i<TILE_WIDTH; ++i){
         //     accum += rowTile[threadIdx.y][i] * colTile[i][threadIdx.x];
         // }
-        //__syncthreads();
+        __syncthreads();
 
     }
     wmma::store_matrix_sync(out_ptr, c_frag, 16, wmma::mem_row_major);
@@ -107,6 +107,8 @@ __global__ void matrixMultiplyShared(float *x, float *k, float *y,
     // }
 
     if (row < M && col < H_out*W_out) {
+        //y4d(b, row, col/W_out, col%W_out) = accum;
+
         y4d(b, row, col/W_out, col%W_out) = outTile[threadIdx.y][threadIdx.x];
     }
             //y4d(b, row, col/W_out, col%W_out) = outTile[threadIdx.y][threadIdx.x];
