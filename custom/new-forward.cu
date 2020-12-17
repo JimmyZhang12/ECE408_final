@@ -59,11 +59,11 @@ __global__ void matrixMultiplyShared(float * __restrict__ x, float * __restrict_
     float *out_ptr = &outTile[0][0];
 
 #pragma unroll
-    for(int p=0; p<ceil(k_cols / (float)TILE_WIDTH); ++p){
+    for(int p=0; p<13; ++p){ // 13 = ceil(k_cols / (float)TILE_WIDTH)
 
         int c = ((int) (__fdividef((threadIdx.x + p*TILE_WIDTH),(K2))));
         int k_remain =  int_mod((threadIdx.x + p*TILE_WIDTH), (K2));
-
+        __syncthreads();
         if (row < k_rows && (threadIdx.x + p*TILE_WIDTH) < k_cols) 
             rowTile[threadIdx.y][threadIdx.x] = k4d_2(row, c, ((int) (__fdividef(k_remain,K))), int_mod(k_remain,K));
         else
@@ -93,7 +93,7 @@ __global__ void matrixMultiplyShared(float * __restrict__ x, float * __restrict_
     
 }
 
-__global__ void conv_forward_kernel(float *y, const float * __restrict__ x, const int B, const int M, const int C, const int H, const int W, const int K)
+__global__ void conv_forward_kernel(float * __restrict__ y, const float * __restrict__ x, const int B, const int M, const int C, const int H, const int W, const int K)
 {
     /*
     Modify this function to implement the forward pass described in Chapter 16.
@@ -132,20 +132,21 @@ __global__ void conv_forward_kernel(float *y, const float * __restrict__ x, cons
     int b = blockIdx.z;
     
     // compute for each kernel
-    if (x_idx < W_out && y_idx < H_out)
-    #pragma unroll
-    for (int m = 0; m < M; m++) { // This kernel is only used on the first layer. So fix the inputs here to unroll.
-        float val = 0;
-        // iterate over y
+    if (x_idx < W_out && y_idx < H_out) {
         #pragma unroll
-        for (int p = 0; p < K; p++) {
-            // iterate over x
+        for (int m = 0; m < 4; m++) { // This kernel is only used on the first layer. So fix the inputs here to unroll.
+            float val = 0;
+            // iterate over y
             #pragma unroll
-            for (int q = 0; q < K; q++) {
-                val += x4d(b,0,y_idx+p,x_idx+q) * k1_4d(m,0,p,q);
+            for (int p = 0; p < 7; p++) {
+                // iterate over x
+                #pragma unroll
+                for (int q = 0; q < 7; q++) {
+                    val += x4d(b,0,y_idx+p,x_idx+q) * k1_4d(m,0,p,q);
+                }
             }
+            y4d(b, m, y_idx, x_idx) = val;
         }
-        y4d(b, m, y_idx, x_idx) = val;
     }
 
 #undef y4d
@@ -171,10 +172,8 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     cudaMalloc((void **) &device_x, (B*C*H*W) * sizeof(float));
     //cudaMalloc((void **) &device_k, (C*M*K*K) * sizeof(__half));
     cudaMalloc((void **) &device_y, (B*M*H_out*W_out) * sizeof(float));
-    host_k_half = (__half*) malloc(M*C*K*K*sizeof(__half));
+    if (M == 16) host_k_half = (__half*) malloc(M*C*K*K*sizeof(__half));
 
-    for (int c = 0; c < M*C*K*K; c++)
-        host_k_half[c] = __float2half(host_k[c]);
 
     bool val;
 
@@ -192,6 +191,9 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     }
 
     if (M == 16) {
+        for (int c = 0; c < M*C*K*K; c++)
+            host_k_half[c] = __float2half(host_k[c]);
+
         cudaMemcpyToSymbol(K_TWO, host_k_half, M*C*K*K*sizeof(__half));
         dim3 gridDim(ceil(H_out*W_out/(1.0 * TILE_WIDTH)), ceil(M/(1.0 * TILE_WIDTH)), B);
         dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
@@ -212,7 +214,7 @@ __host__ void GPUInterface::conv_forward_gpu(float *host_y, const float *host_x,
     // Free device memory
     cudaFree(device_y);
     cudaFree(device_x);
-    free(host_k_half);
+    if (M == 16) free(host_k_half);
     //cudaFree(device_k);
 
 }
